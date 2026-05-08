@@ -4,12 +4,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import tempfile
 import os
-import sys
 import numpy as np
-
-# Add modules to path
-sys.path.append(os.path.join(os.path.dirname(__file__), 'audio_depression'))
-sys.path.append(os.path.join(os.path.dirname(__file__), 'text_depression'))
 
 # Import prediction functions
 from audio_depression.predict import predict_depression as predict_audio
@@ -69,16 +64,16 @@ def get_risk_message(label: str, confidence: float) -> str:
     """Generate appropriate message based on prediction"""
     if label == "Depressed":
         if confidence >= 0.80:
-            return "⚠️ HIGH RISK: Strong indicators of depression detected. Please consider consulting a mental health professional immediately."
+            return " HIGH RISK: Strong indicators of depression detected. Please consider consulting a mental health professional immediately."
         elif confidence >= 0.60:
-            return "🔴 MODERATE RISK: Signs of depression detected. We recommend speaking with a counselor or therapist."
+            return " MODERATE RISK: Signs of depression detected. We recommend speaking with a counselor or therapist."
         else:
-            return "🟡 LOW RISK: Some concerning patterns detected. Consider monitoring your mental health."
+            return " LOW RISK: Some concerning patterns detected. Consider monitoring your mental health."
     else:
         if confidence >= 0.80:
-            return "✅ LOW RISK: No significant signs of depression detected. Continue taking care of your mental health."
+            return " LOW RISK: No significant signs of depression detected. Continue taking care of your mental health."
         else:
-            return "🟢 INCONCLUSIVE: Results are mixed. Consider professional evaluation if you have concerns."
+            return " INCONCLUSIVE: Results are mixed. Consider professional evaluation if you have concerns."
 
 def fusion_predictions(audio_result: dict, text_result: dict, method: str = "weighted_average"):
     """
@@ -96,24 +91,7 @@ def fusion_predictions(audio_result: dict, text_result: dict, method: str = "wei
     if method == "weighted_average":
         # Weight: 60% text, 40% audio
         ensemble_prob = 0.6 * text_prob_depressed + 0.4 * audio_prob_depressed
-        
-    elif method == "simple_average":
-        # Equal weights
-        ensemble_prob = 0.5 * text_prob_depressed + 0.5 * audio_prob_depressed
-        
-    elif method == "max_confidence":
-        # Use prediction with higher confidence
-        if audio_result['confidence'] > text_result['confidence']:
-            ensemble_prob = audio_prob_depressed
-        else:
-            ensemble_prob = text_prob_depressed
             
-    elif method == "voting":
-        # Majority vote (if tied, use text prediction)
-        votes = [audio_result['prediction'], text_result['prediction']]
-        ensemble_prediction = 1 if sum(votes) >= 1 else 0
-        ensemble_prob = text_prob_depressed  # Use text probability as baseline
-        
     else:
         # Default to weighted average
         ensemble_prob = 0.6 * text_prob_depressed + 0.4 * audio_prob_depressed
@@ -154,7 +132,7 @@ async def predict_audio_endpoint(
     audio: UploadFile = File(..., description="Audio file (WAV, MP3, FLAC, OGG)")
 ):
     """
-    🎵 AUDIO-ONLY PREDICTION
+     AUDIO-ONLY PREDICTION
     
     Analyze audio file for depression indicators based on acoustic features:
     - Pitch variation
@@ -198,6 +176,15 @@ async def predict_audio_endpoint(
             status_code=500, 
             detail=f"Audio model not found. Please train the model first: {str(e)}"
         )
+    except MemoryError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Audio analysis failed due to insufficient memory while extracting features. "
+                "Try a shorter clip (e.g., <= 60s) or a lower sample-rate file. "
+                f"({type(e).__name__}: {e})"
+            ),
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Audio analysis failed: {str(e)}")
     finally:
@@ -207,7 +194,7 @@ async def predict_audio_endpoint(
 @app.post("/predict/text", response_model=TextResponse)
 async def predict_text_endpoint(request: TextRequest):
     """
-    📝 TEXT-ONLY PREDICTION
+     TEXT-ONLY PREDICTION
     
     Analyze text for depression indicators based on linguistic features:
     - Sentiment analysis
@@ -240,6 +227,11 @@ async def predict_text_endpoint(request: TextRequest):
             status_code=500, 
             detail=f"Text model not found. Please train the model first: {str(e)}"
         )
+    except (ValueError, RuntimeError) as e:
+        # ValueError: usually user input too short/invalid after cleaning
+        # RuntimeError: usually server-side artifact mismatch
+        status = 422 if isinstance(e, ValueError) else 500
+        raise HTTPException(status_code=status, detail=f"Text analysis failed: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Text analysis failed: {str(e)}")
 
@@ -250,16 +242,13 @@ async def predict_fusion_endpoint(
     fusion_method: str = Form("weighted_average", description="Fusion method: weighted_average, simple_average, max_confidence, voting")
 ):
     """
-    🔬 MULTI-MODAL FUSION PREDICTION (MOST ACCURATE)
+     MULTI-MODAL FUSION PREDICTION (MOST ACCURATE)
     
     Analyze BOTH audio and text together for maximum accuracy.
     Combines acoustic and linguistic features using ensemble methods.
     
     **Fusion Methods:**
     - `weighted_average` (default): 60% text + 40% audio (recommended)
-    - `simple_average`: 50% text + 50% audio
-    - `max_confidence`: Use prediction with higher confidence
-    - `voting`: Majority vote between models
     
     **Input:** 
     - Audio file (WAV, MP3, FLAC, OGG, WEBM)
@@ -280,7 +269,7 @@ async def predict_fusion_endpoint(
             detail=f"Invalid audio file type. Supported: {', '.join(allowed_extensions)}"
         )
     
-    if fusion_method not in ["weighted_average", "simple_average", "max_confidence", "voting"]:
+    if fusion_method not in ["weighted_average"]:
         raise HTTPException(
             status_code=400,
             detail="Invalid fusion method. Choose: weighted_average, simple_average, max_confidence, voting"
@@ -377,24 +366,18 @@ async def api_info():
         "supported_audio_formats": [".wav", ".mp3", ".flac", ".ogg", ".webm"],
         "fusion_methods": [
             "weighted_average (60% text, 40% audio) - RECOMMENDED",
-            "simple_average (50% text, 50% audio)",
-            "max_confidence (use model with higher confidence)",
-            "voting (majority vote)"
         ],
         "note": "Visit /docs for interactive API testing with Swagger UI"
     }
 
-# ==================== Run Server ====================
 if __name__ == "__main__":
     import uvicorn
     print("\n" + "="*60)
-    print("🚀 Starting Depression Detection API Server")
+    print(" Starting Depression Detection API Server")
     print("="*60)
-    print("📍 API will be available at: http://localhost:8000")
-    print("📖 Interactive docs at: http://localhost:8000/docs")
-    print("📊 Alternative docs at: http://localhost:8000/redoc")
+    print(" API will be available at: http://localhost:8000")
+    print(" Interactive docs at: http://localhost:8000/docs")
+    print(" Alternative docs at: http://localhost:8000/redoc")
     print("="*60 + "\n")
     
-    # ✅ For development: Use CLI instead (uvicorn app:app --reload)
-    # ✅ For production: Remove reload
     uvicorn.run(app, host="0.0.0.0", port=8000)

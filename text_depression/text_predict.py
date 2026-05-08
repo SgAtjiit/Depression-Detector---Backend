@@ -1,16 +1,47 @@
-import numpy as np
-import pandas as pd
-import joblib
 import os
-from text_config import (
-    BEST_MODEL_PATH,
-    VECTORIZER_PATH,
-    SCALER_PATH,
-    MODELS_DIR
-)
+from functools import lru_cache
 
+import joblib
+import numpy as np
+
+try:
+    # Package / API usage (imported as text_depression.text_predict)
+    from .text_config import BEST_MODEL_PATH, MODELS_DIR, SCALER_PATH, VECTORIZER_PATH
+except Exception:
+    # Script usage fallback (python text_predict.py ...)
+    from text_config import BEST_MODEL_PATH, MODELS_DIR, SCALER_PATH, VECTORIZER_PATH
+
+
+def clean_text(text: str) -> str:
+    """Match the cleaning approach used in the notebook.
+
+    - Remove timestamps like "2.1,3.2," and standalone floats
+    - Remove confidence fragments like ", 0.9876"
+    - Remove standalone integers
+    - Keep basic punctuation; lowercase
+    """
+    if text is None:
+        return ""
+    text = str(text)
+    if text.strip() == "":
+        return ""
+
+    import re
+
+    text = re.sub(r"\d+\.\d+,\s*\d+\.\d+,", "", text)
+    text = re.sub(r",\s*0\.\d+", "", text)
+    text = re.sub(r"\d+\.\d+,", "", text)
+    text = re.sub(r"\b\d+\b", "", text)
+    text = re.sub(r",+", ",", text)
+    text = text.strip(",")
+    text = re.sub(r"[^a-zA-Z\s\.\,\?\!\'\-]", "", text)
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+@lru_cache(maxsize=1)
 def load_text_model_and_artifacts():
-    """Load trained text model, vectorizer, scaler, and selector"""
+    """Load trained text model artifacts (cached)."""
     model_path = BEST_MODEL_PATH
     vectorizer_path = VECTORIZER_PATH
     scaler_path = SCALER_PATH
@@ -29,17 +60,42 @@ def load_text_model_and_artifacts():
             missing_files.append(f"{name}: {path}")
     
     if missing_files:
-        print("❌ Missing required files:")
-        for mf in missing_files:
-            print(f"   - {mf}")
         raise FileNotFoundError(
-            f"Please train the model first by running: python text_depression/text_train.py"
+            "Missing required model artifacts in text_depression/models.\n"
+            "Place these files (exported from your training notebook) and retry:\n- "
+            + "\n- ".join(missing_files)
         )
     
     model = joblib.load(model_path)
     vectorizer = joblib.load(vectorizer_path)
     scaler = joblib.load(scaler_path)
     selector = joblib.load(selector_path)
+
+    # Basic compatibility checks to avoid runtime 500s later.
+    # These artifacts must come from the same training run.
+    try:
+        vec_dim = vectorizer.transform(["sanity check"]).shape[1]
+    except Exception:
+        vec_dim = getattr(vectorizer, "n_features_in_", None)
+
+    sel_dim = getattr(selector, "n_features_in_", None)
+    if vec_dim is not None and sel_dim is not None and int(vec_dim) != int(sel_dim):
+        raise RuntimeError(
+            "Text model artifacts mismatch: the vectorizer produces "
+            f"{int(vec_dim)} features but the feature selector expects {int(sel_dim)}. "
+            "Re-export `best_text_model.pkl`, `text_vectorizer.pkl`, `text_scaler.pkl`, and `feature_selector.pkl` "
+            "from the same training run (do not mix files from different runs)."
+        )
+
+    # If scaler has expected input features, validate selector output size.
+    scaler_dim = getattr(scaler, "n_features_in_", None)
+    sel_k = getattr(selector, "k", None)
+    if scaler_dim is not None and sel_k is not None and int(scaler_dim) != int(sel_k):
+        raise RuntimeError(
+            "Text model artifacts mismatch: the scaler expects "
+            f"{int(scaler_dim)} features but the selector is configured for k={int(sel_k)}. "
+            "Re-export artifacts from the same training run."
+        )
     
     return model, vectorizer, scaler, selector
 
@@ -73,9 +129,13 @@ def predict_depression_from_text(text):
         raise ValueError("Text is too short. Please provide at least 10 characters.")
     
     model, vectorizer, scaler, selector = load_text_model_and_artifacts()
-    
-    # Apply pipeline
-    text_tfidf = vectorizer.transform([text])
+
+    cleaned_text = clean_text(text)
+    if len(cleaned_text) < 10:
+        raise ValueError("Text is too short after cleaning. Please provide more content.")
+
+    # Apply notebook-equivalent pipeline
+    text_tfidf = vectorizer.transform([cleaned_text])
     text_selected = selector.transform(text_tfidf)
     text_scaled = scaler.transform(text_selected.toarray())
     
@@ -84,7 +144,7 @@ def predict_depression_from_text(text):
     probability = model.predict_proba(text_scaled)[0]
     
     # Extract linguistic features
-    ling_features = extract_linguistic_features(text)
+    ling_features = extract_linguistic_features(cleaned_text)
     
     result = {
         'prediction': int(prediction),

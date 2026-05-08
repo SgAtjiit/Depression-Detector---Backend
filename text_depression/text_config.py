@@ -45,26 +45,3 @@ EPOCHS = 50
 
 # ===== FEATURE SELECTION =====
 N_FEATURES_TO_SELECT = 1000  # Number of features to select using SelectKBest
-
-# ===== CREATE DIRECTORIES =====
-def create_directories():
-    """Create all necessary directories inside the project folder"""
-    directories = [
-        DATA_DIR,
-        FEATURES_DIR,
-        PROCESSED_DIR,
-        MODELS_DIR,
-        RESULTS_DIR,
-        PLOTS_DIR,
-        METRICS_DIR
-    ]
-    
-    for directory in directories:
-        os.makedirs(directory, exist_ok=True)
-    
-    print(f"✅ All directories created inside: {PROJECT_ROOT}")
-    print(f"✅ Dataset location (external): {DATASET_DIR}")
-    print(f"✅ Labels location (external): {LABELS_DIR}")
-
-# Create directories on import
-create_directories()

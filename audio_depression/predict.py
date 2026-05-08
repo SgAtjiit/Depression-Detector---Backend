@@ -1,121 +1,158 @@
-import numpy as np
-import pandas as pd
-import joblib
 import os
-import librosa
-import soundfile as sf
-from pydub import AudioSegment
+import tempfile
 from io import BytesIO
-from config import (
-    BEST_MODEL_PATH, 
-    SCALER_PATH, 
-    SCALER_INITIAL_PATH,
-    SELECTOR_PATH,
-    MODELS_DIR
-)
-from feature_extraction import extract_features_from_file
+from functools import lru_cache
 
-def convert_audio_to_wav(audio_path_or_bytes, output_path="temp_audio.wav"):
+import joblib
+import librosa
+import pandas as pd
+import soundfile as sf
+
+try:
+    from pydub import AudioSegment
+except Exception:
+    AudioSegment = None
+
+
+class AudioConversionError(RuntimeError):
+    pass
+
+try:
+    # Package import
+    from .config import (
+        BEST_MODEL_PATH,
+        SCALER_INITIAL_PATH,
+        SCALER_FINAL_PATH,
+        SELECTOR_PATH,
+        LEGACY_SCALER_FINAL_PATH,
+        SAMPLE_RATE,
+        MAX_DURATION,
+        N_FFT,
+        HOP_LENGTH,
+        N_MELS,
+    )
+    from .feature_extraction import extract_features_from_file
+except Exception:
+    # Script import fallback
+    from config import (
+        BEST_MODEL_PATH,
+        SCALER_INITIAL_PATH,
+        SCALER_FINAL_PATH,
+        SELECTOR_PATH,
+        LEGACY_SCALER_FINAL_PATH,
+        SAMPLE_RATE,
+        MAX_DURATION,
+        N_FFT,
+        HOP_LENGTH,
+        N_MELS,
+    )
+    from feature_extraction import extract_features_from_file
+
+def convert_audio_to_wav(audio_path_or_bytes, output_path: str) -> str:
     """
     Convert any audio format to WAV (handles webm, mp3, etc.)
-    ✅ Works with both file paths and byte streams
+    Works with both file paths and byte streams
     """
-    try:
-        # Check if input is bytes or file path
-        if isinstance(audio_path_or_bytes, (bytes, BytesIO)):
-            # Load from bytes
-            audio = AudioSegment.from_file(BytesIO(audio_path_or_bytes) if isinstance(audio_path_or_bytes, bytes) else audio_path_or_bytes)
-        else:
-            # Load from file path
-            audio = AudioSegment.from_file(audio_path_or_bytes)
-        
-        # Convert to WAV
-        audio = audio.set_frame_rate(16000).set_channels(1)  # Mono, 16kHz
-        audio.export(output_path, format="wav")
-        
-        print(f"✅ Converted audio to WAV: {output_path}")
-        return output_path
-    
-    except Exception as e:
-        print(f"⚠️  Audio conversion failed: {e}")
-        return audio_path_or_bytes
-
-def load_model_and_artifacts():
-    """Load trained ensemble model, scalers, and feature selector"""
-    required_files = {
-        'model': BEST_MODEL_PATH,
-        'scaler_initial': SCALER_INITIAL_PATH,
-        'scaler_final': SCALER_PATH,
-        'selector': SELECTOR_PATH
-    }
-    
-    missing_files = []
-    for name, path in required_files.items():
-        if not os.path.exists(path):
-            missing_files.append(f"{name}: {path}")
-    
-    if missing_files:
-        print("❌ Missing required files:")
-        for mf in missing_files:
-            print(f"   - {mf}")
-        raise FileNotFoundError(
-            f"Please train the model first by running: python audio_depression/train.py"
+    if AudioSegment is None:
+        raise AudioConversionError(
+            "Audio conversion requires ffmpeg. Either upload a WAV file, or install ffmpeg and ensure it's on PATH."
         )
-    
+
+    try:
+        if isinstance(audio_path_or_bytes, (bytes, BytesIO)):
+            stream = BytesIO(audio_path_or_bytes) if isinstance(audio_path_or_bytes, bytes) else audio_path_or_bytes
+            audio = AudioSegment.from_file(stream)
+        else:
+            audio = AudioSegment.from_file(audio_path_or_bytes)
+
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        audio.export(output_path, format="wav")
+        return output_path
+    except Exception as e:
+        raise AudioConversionError(
+            f"Failed to decode/convert audio to WAV. Install ffmpeg and retry, or upload WAV. ({type(e).__name__}: {e})"
+        ) from e
+
+def _resolve_scaler_final_path() -> str:
+    if os.path.exists(SCALER_FINAL_PATH):
+        return SCALER_FINAL_PATH
+    if os.path.exists(LEGACY_SCALER_FINAL_PATH):
+        return LEGACY_SCALER_FINAL_PATH
+    return SCALER_FINAL_PATH
+
+
+@lru_cache(maxsize=1)
+def load_model_and_artifacts():
+    """Load trained model, scalers, and feature selector (cached)."""
+    scaler_final_path = _resolve_scaler_final_path()
+    required_files = {
+        "model": BEST_MODEL_PATH,
+        "scaler_initial": SCALER_INITIAL_PATH,
+        "scaler_final": scaler_final_path,
+        "selector": SELECTOR_PATH,
+    }
+
+    missing = [f"{name}: {path}" for name, path in required_files.items() if not os.path.exists(path)]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required model artifacts in audio_depression/models.\n"
+            "Place these files (exported from Colab training) and retry:\n- "
+            + "\n- ".join(missing)
+        )
+
     model = joblib.load(BEST_MODEL_PATH)
     scaler_initial = joblib.load(SCALER_INITIAL_PATH)
-    scaler_final = joblib.load(SCALER_PATH)
+    scaler_final = joblib.load(scaler_final_path)
     selector = joblib.load(SELECTOR_PATH)
-    
     return model, scaler_initial, scaler_final, selector
 
 def predict_depression(audio_path_or_bytes):
     """
     Predict depression from audio file or bytes
-    ✅ Automatically handles variable duration audio
-    ✅ Converts any format to WAV
+     Automatically handles variable duration audio
+     Converts any format to WAV
     Returns: dict with prediction, probabilities, and confidence
     """
     temp_file = None
     
     try:
-        # ✅ Convert audio to WAV if needed
+        # Convert audio to WAV if needed
         if isinstance(audio_path_or_bytes, (bytes, BytesIO)):
-            print("🔄 Processing audio bytes...")
-            temp_file = "temp_audio.wav"
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            tmp.close()
+            temp_file = tmp.name
             audio_path = convert_audio_to_wav(audio_path_or_bytes, temp_file)
         else:
             if not os.path.exists(audio_path_or_bytes):
                 raise FileNotFoundError(f"Audio file not found: {audio_path_or_bytes}")
-            
-            # Check if conversion is needed
-            if not audio_path_or_bytes.lower().endswith('.wav'):
-                print(f"🔄 Converting {audio_path_or_bytes} to WAV...")
-                temp_file = "temp_audio_converted.wav"
+
+            if not str(audio_path_or_bytes).lower().endswith(".wav"):
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+                tmp.close()
+                temp_file = tmp.name
                 audio_path = convert_audio_to_wav(audio_path_or_bytes, temp_file)
             else:
                 audio_path = audio_path_or_bytes
+
+        if not str(audio_path).lower().endswith(".wav"):
+            raise AudioConversionError(
+                "Audio must be WAV for feature extraction. Upload WAV or enable conversion by installing ffmpeg."
+            )
         
-        # Load model artifacts
         model, scaler_initial, scaler_final, selector = load_model_and_artifacts()
         
-        # ✅ Get audio duration using soundfile (more reliable)
+        # Get audio duration using soundfile (more reliable)
         try:
             audio_info = sf.info(audio_path)
             audio_duration = audio_info.duration
-            print(f"🎵 Audio duration: {audio_duration:.1f}s (sample rate: {audio_info.samplerate} Hz)")
         except Exception as e:
-            print(f"⚠️  Using librosa for duration: {e}")
             audio_duration = librosa.get_duration(path=audio_path)
-            print(f"🎵 Audio duration: {audio_duration:.1f}s")
         
-        # Extract features (automatically handles duration)
-        print(f"🔬 Extracting features...")
-        features_dict = extract_features_from_file(audio_path, sr_target=16000, max_duration=180)
+        # Extract features (bounded duration + lower-memory STFT params)
+        features_dict = extract_features_from_file(audio_path,sr_target=16000,max_duration=MAX_DURATION,)
         
         # Remove audio_duration if present (not a feature for model)
         actual_duration = features_dict.pop('audio_duration', audio_duration)
-        print(f"✅ Analyzed duration: {actual_duration:.1f}s")
         
         features_df = pd.DataFrame([features_dict])
         
@@ -139,15 +176,9 @@ def predict_depression(audio_path_or_bytes):
             'audio_duration': float(audio_duration),
             'analyzed_duration': float(actual_duration)
         }
-        
-        print(f"✅ Prediction complete: {result['label']} ({result['confidence']:.2%} confidence)")
-        
         return result
     
-    except Exception as e:
-        print(f"❌ Prediction error: {str(e)}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         raise
     
     finally:
@@ -155,7 +186,6 @@ def predict_depression(audio_path_or_bytes):
         if temp_file and os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
-                print(f"🗑️  Cleaned up: {temp_file}")
             except:
                 pass
 
@@ -167,20 +197,16 @@ if __name__ == "__main__":
         
         try:
             result = predict_depression(audio_path)
-            
-            print("\n" + "="*60)
-            print(f"🎯 Prediction: {result['label']}")
-            print(f"📊 Confidence: {result['confidence']:.2%}")
-            print(f"\n📈 Probabilities:")
-            print(f"   Not Depressed: {result['probability']['not_depressed']:.2%}")
-            print(f"   Depressed:     {result['probability']['depressed']:.2%}")
-            print(f"\n⏱️  Duration Info:")
-            print(f"   Original audio: {result['audio_duration']:.1f}s")
-            print(f"   Analyzed:       {result['analyzed_duration']:.1f}s")
-            print("="*60)
-        
+
+            print("\n" + "=" * 60)
+            print(f"Prediction: {result['label']}")
+            print(f"Confidence: {result['confidence']:.2%}")
+            print(f"P(Not Depressed): {result['probability']['not_depressed']:.2%}")
+            print(f"P(Depressed):     {result['probability']['depressed']:.2%}")
+            print("=" * 60)
+
         except Exception as e:
-            print(f"\n❌ Error: {str(e)}")
+            print(f"\nError: {str(e)}")
             sys.exit(1)
     else:
         print("Usage: python predict.py <path_to_audio_file>")
